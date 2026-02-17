@@ -1,0 +1,31 @@
+# Core dependencies
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Polymarket SDK
+py-clob-client>=0.20.0
+
+# Data processing (using newer versions with pre-built wheels)
+pandas>=2.2.0
+numpy>=1.26.0
+
+# Database
+sqlalchemy>=2.0.0
+
+# Scheduling
+APScheduler>=3.10.0
+
+# API & background services
+fastapi>=0.109.0
+uvicorn[standard]>=0.25.0
+
+# Utilities
+pytz>=2023.3
+python-dateutil>=2.8.0
+
+# Async HTTP (for parallel API calls in scanner)
+aiohttp>=3.9.0
+
+# Development
+pytest>=7.4.0
+scipy>=1.11.0

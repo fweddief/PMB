@@ -1,0 +1,46 @@
+{
+  "tracked_markets": [
+    {
+      "id": "166344",
+      "name": "Elon Musk # tweets January 17 - January 19, 2026?",
+      "url": "https://polymarket.com/event/elon-musk-of-tweets-january-17-january-19",
+      "ends": "2026-01-19",
+      "status": "open"
+    },
+    {
+      "id": "154572",
+      "name": "Elon Musk # tweets January 13 - January 20, 2026?",
+      "url": "https://polymarket.com/event/elon-musk-of-tweets-january-13-january-20",
+      "ends": "2026-01-20",
+      "status": "open"
+    },
+    {
+      "id": "170524",
+      "name": "Elon Musk # tweets January 19 - January 21, 2026?",
+      "url": "https://polymarket.com/event/elon-musk-of-tweets-january-19-january-21",
+      "ends": "2026-01-21",
+      "status": "open"
+    },
+    {
+      "id": "160906",
+      "name": "Elon Musk # tweets January 16 - January 23, 2026?",
+      "url": "https://polymarket.com/event/elon-musk-of-tweets-january-16-january-23",
+      "ends": "2026-01-23",
+      "status": "open"
+    },
+    {
+      "id": "174869",
+      "name": "Elon Musk # tweets January 22 - January 24, 2026?",
+      "url": "https://polymarket.com/event/elon-musk-of-tweets-january-22-january-24",
+      "ends": "2026-01-24",
+      "status": "open"
+    },
+    {
+      "id": "169441",
+      "name": "Elon Musk # tweets January 20 - January 27, 2026?",
+      "url": "https://polymarket.com/event/elon-musk-of-tweets-january-20-january-27",
+      "ends": "2026-01-27",
+      "status": "open"
+    }
+  ]
+}
