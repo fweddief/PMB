@@ -53,7 +53,7 @@ class PolymarketScraper:
 
                 logger.info("Initializing CLOB client with private key...")
 
-                signature_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))
+                signature_type = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "1"))
                 funder_override = os.getenv("POLYMARKET_FUNDER_ADDRESS")
 
                 # Get funder address from private key for GNOSIS_SAFE signature type
