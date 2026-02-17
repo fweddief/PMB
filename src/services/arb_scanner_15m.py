@@ -623,8 +623,8 @@ def main():
     parser.add_argument(
         "--budget",
         type=float,
-        default=2.26,
-        help="Maximum USD per trade (default: $2.26)",
+        default=2.0,
+        help="Maximum USD per trade (default: $2.00)",
     )
     args = parser.parse_args()
 
