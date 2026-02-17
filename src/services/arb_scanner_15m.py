@@ -431,10 +431,12 @@ class MomentumTrader:
 
         on_chain_cash = self.get_available_cash()
         if self.local_cash is None:
-            self.local_cash = on_chain_cash
-        cash = min(on_chain_cash, self.local_cash, self.per_trade_budget)
+            # Trust --budget if on-chain query returns 0 (common with proxy wallets)
+            self.local_cash = on_chain_cash if on_chain_cash > 0 else self.per_trade_budget
+        cash = min(self.local_cash, self.per_trade_budget)
         if cash <= 0:
-            logger.warning("No available cash (on-chain=$%.2f, local=$%.2f)", on_chain_cash, self.local_cash)
+            logger.warning("No available cash (on-chain=$%.2f, local=$%.2f, budget=$%.2f)",
+                           on_chain_cash, self.local_cash, self.per_trade_budget)
             return
 
         import math
