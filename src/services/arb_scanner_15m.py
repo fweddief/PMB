@@ -287,8 +287,8 @@ class MomentumTrader:
             logger.error("Error getting book for sell check: %s", e)
             best_bid = None
 
-        # Sell at $0.98+ if bid is there
-        if best_bid is not None and best_bid >= 0.98 and not pos.get("sell_failed"):
+        # Sell at $0.97+ if bid is there
+        if best_bid is not None and best_bid >= 0.97 and not pos.get("sell_failed"):
             proceeds = pos["shares"] * best_bid
             cost = pos.get("actual_cost", pos["entry_price"] * pos["shares"])
             pnl = proceeds - cost
@@ -328,15 +328,58 @@ class MomentumTrader:
             self.position = None
             return
 
-        # Check if market has resolved (end_date passed) — stop and let user claim
+        # Market expiring — force-sell at whatever price to avoid stuck position
         if now >= market["end_date"]:
             logger.info(
-                "MARKET EXPIRING  %s @ $%.3f  |  %d shares  |  bid was $%s",
+                "MARKET EXPIRING — force-selling  %s @ $%.3f  |  %d shares  |  bid $%s",
                 pos["side"], pos["entry_price"], pos["shares"],
                 f"{best_bid:.3f}" if best_bid is not None else "none",
             )
-            logger.info("ACTION REQUIRED: Please claim your position manually!")
-            # Clear position and continue trading the next market
+            cost = pos.get("actual_cost", pos["entry_price"] * pos["shares"])
+            if best_bid is not None and best_bid > 0 and not self.observe_only:
+                sold = False
+                for attempt in range(1, 6):
+                    try:
+                        sell_result = self.trader.create_market_sell_order(
+                            token_id=pos["token_id"],
+                            shares=pos["shares"],
+                            price=best_bid,
+                        )
+                        if sell_result:
+                            logger.info("Expiry sell submitted: %s", sell_result)
+                            sold = True
+                            break
+                        else:
+                            logger.warning("Expiry sell returned None (attempt %d/5)", attempt)
+                    except Exception as e:
+                        logger.error("Expiry sell attempt %d/5 failed: %s", attempt, e)
+                    if attempt < 5:
+                        time.sleep(3)
+                if sold:
+                    proceeds = pos["shares"] * best_bid
+                    pnl = proceeds - cost
+                    self.stats["resolved"] += 1
+                    if pnl >= 0:
+                        self.stats["wins"] += 1
+                    self.stats["total_pnl"] += pnl
+                    self.per_trade_budget += pnl
+                    self.local_cash = (self.local_cash or 0) + proceeds
+                    logger.info("Expiry sell OK — P&L %+.2f. Budget now $%.2f", pnl, self.per_trade_budget)
+                else:
+                    logger.warning("All expiry sell attempts failed — clearing position as loss")
+                    pnl = -cost
+                    self.stats["resolved"] += 1
+                    self.stats["total_pnl"] += pnl
+                    self.per_trade_budget += pnl
+            else:
+                if self.observe_only:
+                    logger.info("Observe-only: would force-sell at expiry")
+                else:
+                    logger.warning("No bid available at expiry — clearing position as loss")
+                    pnl = -cost
+                    self.stats["resolved"] += 1
+                    self.stats["total_pnl"] += pnl
+                    self.per_trade_budget += pnl
             self.position = None
             return
 
@@ -578,8 +621,8 @@ def main():
     parser.add_argument(
         "--budget",
         type=float,
-        default=10.0,
-        help="Maximum USD per trade (default: $10)",
+        default=2.26,
+        help="Maximum USD per trade (default: $2.26)",
     )
     args = parser.parse_args()
 
