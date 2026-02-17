@@ -60,7 +60,7 @@ class PolymarketTrader:
         self.api_secret = api_secret or os.getenv('POLYMARKET_SECRET')
         self.api_passphrase = api_passphrase or os.getenv('POLYMARKET_PASSPHRASE')
         self.private_key = private_key or os.getenv('POLYMARKET_PRIVATE_KEY')
-        self.signature_type = int(os.getenv('POLYMARKET_SIGNATURE_TYPE', '1'))
+        self.signature_type = int(os.getenv('POLYMARKET_SIGNATURE_TYPE', '2'))
         self.funder_address = os.getenv('POLYMARKET_FUNDER_ADDRESS')
 
         # Risk management
