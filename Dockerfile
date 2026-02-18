@@ -14,4 +14,4 @@ COPY . .
 # Initialize SQLite schema so the container always has required tables
 RUN python scripts/manage.py init
 
-CMD ["sh", "-c", "python scripts/manage.py init && python src/services/arb_scanner_15m.py --live --budget 2"]
+CMD ["sh", "-c", "python scripts/manage.py init && python src/services/arb_scanner_15m.py --exchange polymarket --live --budget 30"]

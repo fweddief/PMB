@@ -5,6 +5,9 @@ python-dotenv>=1.0.0
 # Polymarket SDK
 py-clob-client>=0.20.0
 
+# Kalshi SDK
+kalshi-python>=2.1.0
+
 # Data processing (using newer versions with pre-built wheels)
 pandas>=2.2.0
 numpy>=1.26.0

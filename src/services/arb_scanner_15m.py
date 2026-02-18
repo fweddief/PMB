@@ -1,34 +1,25 @@
 """
-Bitcoin 15-Minute Momentum Trader for Polymarket.
+Bitcoin 15-Minute Momentum Trader (exchange-agnostic).
 
 When either Up or Down reaches $0.87 on the ask, buy that side and ride it
 to market resolution ($1.00 payout).  Stop-loss at $0.75 bid.
 
+Supports both Polymarket and Kalshi via the ExchangeAdapter interface.
+
 Starts in observe-only mode by default.  Run with --live to enable execution.
 
 Usage:
-    PYTHONPATH=src python3 src/services/arb_scanner.py [--live] [--budget 10]
+    PYTHONPATH=src python3 src/services/arb_scanner_15m.py [--live] [--budget 10] [--exchange polymarket|kalshi]
 """
 
-import os
-import sys
-import json
 import time
 import logging
 import argparse
 from datetime import datetime, timezone, timedelta
-from typing import Optional
 
-import requests
 from dotenv import load_dotenv
 
-from trading.polymarket_trader import PolymarketTrader
-from py_clob_client.clob_types import (
-    OrderArgs,
-    BookParams,
-    OrderType,
-)
-from py_clob_client.order_builder.constants import BUY, SELL
+from trading.exchange_adapter import ExchangeAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -36,16 +27,14 @@ logger = logging.getLogger(__name__)
 class MomentumTrader:
     """Buys the winning side of BTC 15-min markets when price hits $0.87."""
 
-    GAMMA_API = "https://gamma-api.polymarket.com"
     ENTRY_PRICE = 0.87       # Buy when best ask >= this
     MAX_ENTRY_PRICE = 0.95   # Don't buy past this price
     STOP_LOSS = 0.75         # Sell if best bid drops below this
     MARKET_REFRESH_INTERVAL = 60   # seconds
     SCAN_INTERVAL = 1.0      # seconds
 
-    def __init__(self, trader: PolymarketTrader, observe_only: bool = True, per_trade_budget: float = 10.0):
-        self.trader = trader
-        self.client = trader.client
+    def __init__(self, exchange: ExchangeAdapter, observe_only: bool = True, per_trade_budget: float = 10.0):
+        self.exchange = exchange
         self.observe_only = observe_only
         self.per_trade_budget = per_trade_budget
         self.total_spent = 0.0
@@ -68,86 +57,26 @@ class MomentumTrader:
         }
 
     # ------------------------------------------------------------------
-    # Market discovery (unchanged)
+    # Market discovery
     # ------------------------------------------------------------------
 
     def discover_markets(self):
-        """Find active BTC 15-min Up/Down markets by predictable slug."""
+        """Find active BTC 15-min Up/Down markets via the exchange adapter."""
         now = datetime.now(timezone.utc)
-        now_ts = int(now.timestamp())
-
-        current_boundary = now_ts - (now_ts % 900)
         known_tokens = {m["yes_token"] for m in self.tracked_markets}
-        new_markets = []
 
-        for i in range(4):
-            window_start = current_boundary + i * 900
-            slug = f"btc-updown-15m-{window_start}"
+        new_markets = self.exchange.discover_btc_15m_markets(now)
 
-            try:
-                resp = requests.get(
-                    f"{self.GAMMA_API}/events",
-                    params={"slug": slug},
-                    timeout=10,
-                )
-                resp.raise_for_status()
-                events = resp.json()
-            except Exception as e:
-                logger.debug("Slug %s fetch failed: %s", slug, e)
-                continue
+        # Deduplicate against already-tracked markets
+        added = []
+        for m in new_markets:
+            if m["yes_token"] not in known_tokens:
+                known_tokens.add(m["yes_token"])
+                added.append(m)
 
-            if not events:
-                continue
-
-            event = events[0] if isinstance(events, list) else events
-            for market in event.get("markets", []):
-                if not market.get("active", False):
-                    continue
-                if market.get("closed", True):
-                    continue
-                if not market.get("acceptingOrders", False):
-                    continue
-
-                raw_ids = market.get("clobTokenIds")
-                if not raw_ids:
-                    continue
-                try:
-                    clob_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
-                except (json.JSONDecodeError, TypeError):
-                    continue
-
-                if len(clob_ids) < 2:
-                    continue
-
-                up_token, down_token = clob_ids[0], clob_ids[1]
-
-                if up_token in known_tokens:
-                    continue
-                known_tokens.add(up_token)
-
-                end_str = market.get("endDate") or market.get("end_date_iso")
-                if end_str:
-                    try:
-                        end_date = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-                    except (ValueError, TypeError):
-                        end_date = datetime.fromtimestamp(window_start + 900, tz=timezone.utc)
-                else:
-                    end_date = datetime.fromtimestamp(window_start + 900, tz=timezone.utc)
-
-                new_markets.append(
-                    {
-                        "yes_token": up_token,
-                        "no_token": down_token,
-                        "question": market.get("question", f"BTC 15m Up/Down ({slug})"),
-                        "end_date": end_date,
-                        "condition_id": market.get("conditionId", ""),
-                        "slug": slug,
-                    }
-                )
-
-        if new_markets:
-            self.tracked_markets.extend(new_markets)
-            for m in new_markets:
+        if added:
+            self.tracked_markets.extend(added)
+            for m in added:
                 logger.info(
                     "NEW MARKET  %s  |  ends %s  |  UP %s...  DOWN %s...",
                     m["question"],
@@ -197,31 +126,22 @@ class MomentumTrader:
         market = active[0]  # Focus on the current window
 
         try:
-            # Fetch books individually to avoid ordering ambiguity
-            yes_books = self.client.get_order_books(
-                [BookParams(token_id=market["yes_token"])]
-            )
-            no_books = self.client.get_order_books(
-                [BookParams(token_id=market["no_token"])]
-            )
-            if not yes_books or not no_books:
-                return
-
-            yes_book, no_book = yes_books[0], no_books[0]
+            yes_book = self.exchange.get_order_book(market["yes_token"])
+            no_book = self.exchange.get_order_book(market["no_token"])
 
             best_up_ask = None
             best_up_size = 0.0
-            if yes_book.asks:
-                best = sorted(yes_book.asks, key=lambda o: float(o.price))[0]
-                best_up_ask = float(best.price)
-                best_up_size = float(best.size)
+            if yes_book["asks"]:
+                best = sorted(yes_book["asks"], key=lambda o: o["price"])[0]
+                best_up_ask = best["price"]
+                best_up_size = best["size"]
 
             best_down_ask = None
             best_down_size = 0.0
-            if no_book.asks:
-                best = sorted(no_book.asks, key=lambda o: float(o.price))[0]
-                best_down_ask = float(best.price)
-                best_down_size = float(best.size)
+            if no_book["asks"]:
+                best = sorted(no_book["asks"], key=lambda o: o["price"])[0]
+                best_down_ask = best["price"]
+                best_down_size = best["size"]
 
             # Sanity check: Up + Down asks should be close to $1.00
             if best_up_ask and best_down_ask:
@@ -274,13 +194,11 @@ class MomentumTrader:
         pos = self.position
         market = pos["market"]
 
-        # Check best bid — if >= $0.99, sell for profit
+        # Check best bid
         try:
-            books = self.client.get_order_books(
-                [BookParams(token_id=pos["token_id"])]
-            )
-            if books and books[0].bids:
-                best_bid = float(sorted(books[0].bids, key=lambda o: float(o.price), reverse=True)[0].price)
+            book = self.exchange.get_order_book(pos["token_id"])
+            if book["bids"]:
+                best_bid = max(b["price"] for b in book["bids"])
             else:
                 best_bid = None
         except Exception as e:
@@ -300,7 +218,7 @@ class MomentumTrader:
                 sold = False
                 for attempt in range(1, 6):
                     try:
-                        sell_result = self.trader.create_market_sell_order(
+                        sell_result = self.exchange.sell(
                             token_id=pos["token_id"],
                             shares=pos["shares"],
                             price=best_bid,
@@ -328,8 +246,32 @@ class MomentumTrader:
             self.position = None
             return
 
-        # Market expiring — force-sell at whatever price to avoid stuck position
+        # Market expiring — check settlement first, then force-sell as fallback
         if now >= market["end_date"]:
+            # Check if market already settled (Kalshi auto-settles at $1.00)
+            settlement = self.exchange.check_settlement(pos["token_id"])
+            if settlement is not None:
+                token_side = "yes" if pos["token_id"] == market["yes_token"] else "no"
+                won = (settlement == token_side)
+                payout = pos["shares"] * 1.00 if won else 0.0
+                cost = pos.get("actual_cost", pos["entry_price"] * pos["shares"])
+                pnl = payout - cost
+
+                logger.info(
+                    "SETTLED  %s  |  result=%s  our_side=%s  |  %s  |  payout $%.2f  P&L %+.2f",
+                    pos["side"], settlement, token_side,
+                    "WIN" if won else "LOSS", payout, pnl,
+                )
+
+                self.stats["resolved"] += 1
+                if won:
+                    self.stats["wins"] += 1
+                self.stats["total_pnl"] += pnl
+                self.per_trade_budget += pnl
+                self.local_cash = (self.local_cash or 0) + payout
+                self.position = None
+                return
+
             logger.info(
                 "MARKET EXPIRING — force-selling  %s @ $%.3f  |  %d shares  |  bid $%s",
                 pos["side"], pos["entry_price"], pos["shares"],
@@ -340,7 +282,7 @@ class MomentumTrader:
                 sold = False
                 for attempt in range(1, 6):
                     try:
-                        sell_result = self.trader.create_market_sell_order(
+                        sell_result = self.exchange.sell(
                             token_id=pos["token_id"],
                             shares=pos["shares"],
                             price=best_bid,
@@ -404,10 +346,9 @@ class MomentumTrader:
     # ------------------------------------------------------------------
 
     def get_available_cash(self) -> float:
-        """Get USDC balance (cash only, not existing positions)."""
+        """Get USD balance via the exchange adapter."""
         try:
-            balance = self.trader.get_balance()
-            return float(balance.get("cash", 0))
+            return self.exchange.get_balance_cash()
         except Exception as e:
             logger.error("Failed to get balance: %s", e)
             return 0.0
@@ -440,7 +381,7 @@ class MomentumTrader:
             return
 
         import math
-        min_shares = math.ceil(1.0 / price)  # ensure order >= $1 minimum
+        min_shares = max(5, math.ceil(1.0 / price))  # Polymarket minimum is 5 shares
         shares = int(min(size, cash / price))
         if shares < min_shares:
             logger.warning(
@@ -458,25 +399,14 @@ class MomentumTrader:
         self.traded_slugs.add(market["slug"])
 
         try:
-            self.trader.ensure_token_allowance(token_id)
+            self.exchange.ensure_ready_to_trade(token_id)
 
-            signed_order = self.client.create_order(
-                OrderArgs(
-                    price=price,
-                    size=float(shares),
-                    side=BUY,
-                    token_id=token_id,
-                )
-            )
-            result = self.client.post_order(signed_order, OrderType.GTC)
+            result = self.exchange.buy(token_id, price, shares)
             logger.info("Order submitted: %s", result)
 
-            # Use actual fill amounts from the result (may be empty strings)
-            taking = result.get("takingAmount", "")
-            making = result.get("makingAmount", "")
-            actual_shares = int(float(taking)) if taking else shares
-            actual_cost = float(making) if making else shares * price
-            actual_price_per_share = actual_cost / actual_shares if actual_shares > 0 else price
+            actual_shares = result["shares"]
+            actual_cost = result["cost"]
+            actual_price_per_share = result["price_per_share"]
 
             logger.info(
                 "FILL  %s  |  %d shares  |  actual cost $%.2f ($%.3f/share)",
@@ -531,7 +461,7 @@ class MomentumTrader:
             sold = False
             for attempt in range(1, 6):
                 try:
-                    result = self.trader.create_market_sell_order(
+                    result = self.exchange.sell(
                         token_id=pos["token_id"],
                         shares=pos["shares"],
                         price=current_bid,
@@ -548,7 +478,7 @@ class MomentumTrader:
                     time.sleep(3)
             if not sold:
                 logger.error("ALL SELL ATTEMPTS FAILED — %d shares of %s stranded!", pos["shares"], pos["side"])
-                logger.error("ACTION REQUIRED: Sell manually on Polymarket!")
+                logger.error("ACTION REQUIRED: Sell manually on %s!", self.exchange.exchange_name.title())
                 return  # Keep position so bot knows shares are stranded
 
         self.stats["resolved"] += 1
@@ -575,7 +505,10 @@ class MomentumTrader:
     def run(self):
         """Main loop: discover markets every 60s, scan books every 1s."""
         mode = "OBSERVE ONLY" if self.observe_only else "LIVE TRADING"
-        logger.info("Momentum Trader starting  |  mode: %s", mode)
+        logger.info(
+            "Momentum Trader starting  |  exchange: %s  |  mode: %s",
+            self.exchange.exchange_name, mode,
+        )
         logger.info(
             "Entry: $%.2f  |  Stop-loss: $%.2f  |  Per-trade: $%.2f  |  scan: %.1fs",
             self.ENTRY_PRICE,
@@ -613,7 +546,7 @@ class MomentumTrader:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Bitcoin 15-min momentum trader for Polymarket"
+        description="Bitcoin 15-min momentum trader (Polymarket / Kalshi)"
     )
     parser.add_argument(
         "--live",
@@ -625,6 +558,12 @@ def main():
         type=float,
         default=2.0,
         help="Maximum USD per trade (default: $2.00)",
+    )
+    parser.add_argument(
+        "--exchange",
+        choices=["polymarket", "kalshi"],
+        default="polymarket",
+        help="Exchange to trade on (default: polymarket)",
     )
     args = parser.parse_args()
 
@@ -639,10 +578,16 @@ def main():
 
     load_dotenv()
 
-    logger.info("Initializing PolymarketTrader...")
-    trader = PolymarketTrader()
+    if args.exchange == "kalshi":
+        from trading.kalshi_trader import KalshiAdapter
+        logger.info("Initializing KalshiAdapter...")
+        exchange = KalshiAdapter()
+    else:
+        from trading.polymarket_adapter import PolymarketAdapter
+        logger.info("Initializing PolymarketAdapter...")
+        exchange = PolymarketAdapter()
 
-    momentum = MomentumTrader(trader, observe_only=not args.live, per_trade_budget=args.budget)
+    momentum = MomentumTrader(exchange, observe_only=not args.live, per_trade_budget=args.budget)
     momentum.run()
 
 

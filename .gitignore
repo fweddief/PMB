@@ -34,3 +34,4 @@ Thumbs.db
 dashboard/node_modules/
 dashboard/.next/
 dashboard/out/
+kalshi_key.pem
