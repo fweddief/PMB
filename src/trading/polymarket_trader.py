@@ -436,7 +436,7 @@ class PolymarketTrader:
             if token_id in self._approved_tokens:
                 self._approved_tokens.discard(token_id)
             self.ensure_token_allowance(token_id)
-            time.sleep(2)  # let approval settle on-chain before submitting sell
+            time.sleep(5)  # let approval settle on-chain before submitting sell
 
             # Use LIMIT ORDER (GTC) instead of market order
             limit_price = price * (1 - slippage_tolerance)
