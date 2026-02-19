@@ -3,7 +3,7 @@ requests>=2.31.0
 python-dotenv>=1.0.0
 
 # Polymarket SDK
-py-clob-client>=0.20.0
+py-clob-client==0.34.5
 
 # Kalshi SDK
 kalshi-python>=2.1.0
