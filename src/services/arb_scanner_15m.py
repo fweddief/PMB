@@ -453,14 +453,15 @@ class MomentumTrader:
             # Do NOT discard slug — order may have gone on-chain before the exception
 
     def execute_stop_loss(self, initial_bid: float):
-        """Sell position to limit loss — retries every 0.5s until filled or market expires."""
+        """Walk the bid book level-by-level — sell as many shares as possible at the best
+        available price, then sell the remainder at the next level down, repeating every
+        0.5s until all shares are gone or the market expires."""
         if not self.position:
             return
 
         pos = self.position
         market = pos["market"]
-        cost = pos.get("actual_cost", pos["entry_price"] * pos["shares"])
-        fill_bid = initial_bid
+        total_cost = pos.get("actual_cost", pos["entry_price"] * pos["shares"])
 
         logger.info(
             "STOP-LOSS  %s @ $%.3f -> $%.3f  |  %d shares",
@@ -468,58 +469,88 @@ class MomentumTrader:
         )
 
         if not self.observe_only:
-            sold = False
-            attempt = 0
-            while not sold:
-                # Let the settlement path handle it if market has already expired
-                if datetime.now(timezone.utc) >= market["end_date"]:
-                    logger.info("Market expired mid-stop-loss — settlement will handle position")
-                    return
+            shares_remaining = pos["shares"]
+            total_proceeds = 0.0
 
-                attempt += 1
-                # Refresh bid on every attempt so FOK uses the live price
+            while shares_remaining > 0:
+                # Market expired mid-sell — record partial P&L and let settlement
+                # handle the remaining shares
+                if datetime.now(timezone.utc) >= market["end_date"]:
+                    sold_shares = pos["shares"] - shares_remaining
+                    logger.info(
+                        "Market expired — sold %d/%d shares ($%.2f), %d going to settlement",
+                        sold_shares, pos["shares"], total_proceeds, shares_remaining,
+                    )
+                    if sold_shares > 0:
+                        sold_cost = total_cost * (sold_shares / pos["shares"])
+                        self.stats["total_pnl"] += total_proceeds - sold_cost
+                        self.per_trade_budget += total_proceeds - sold_cost
+                        self.local_cash = (self.local_cash or 0) + total_proceeds
+                        # Shrink position so settlement accounts only for what's left
+                        pos["shares"] = shares_remaining
+                        pos["actual_cost"] = total_cost - sold_cost
+                    return  # settlement path handles the rest
+
                 try:
                     fresh_book = self.exchange.get_order_book(pos["token_id"])
-                    if fresh_book["bids"]:
-                        fill_bid = max(b["price"] for b in fresh_book["bids"])
+                    bids = sorted(
+                        fresh_book["bids"], key=lambda b: b["price"], reverse=True
+                    )
                 except Exception:
-                    pass
-
-                if fill_bid <= 0:
                     time.sleep(0.5)
                     continue
 
-                try:
-                    result = self.exchange.sell(
-                        token_id=pos["token_id"],
-                        shares=pos["shares"],
-                        price=fill_bid,
-                    )
-                    if result:
-                        logger.info(
-                            "Stop-loss filled (attempt %d) @ $%.3f", attempt, fill_bid
-                        )
-                        sold = True
-                    else:
-                        logger.warning("Attempt %d: no fill — retrying in 0.5s", attempt)
-                except Exception as e:
-                    logger.error("Attempt %d failed: %s — retrying", attempt, e)
-
-                if not sold:
+                if not bids:
+                    logger.warning("No bids available — waiting 0.5s")
                     time.sleep(0.5)
+                    continue
+
+                # Walk each bid level, selling as many shares as available at that price
+                for bid in bids:
+                    if shares_remaining <= 0:
+                        break
+                    chunk = min(int(bid["size"]), shares_remaining)
+                    if chunk <= 0:
+                        continue
+                    try:
+                        result = self.exchange.sell(
+                            token_id=pos["token_id"],
+                            shares=chunk,
+                            price=bid["price"],
+                        )
+                        if result:
+                            total_proceeds += chunk * bid["price"]
+                            shares_remaining -= chunk
+                            logger.info(
+                                "Sold %d shares @ $%.3f  |  %d remaining",
+                                chunk, bid["price"], shares_remaining,
+                            )
+                        else:
+                            logger.warning(
+                                "Chunk sell returned None @ $%.3f — will retry",
+                                bid["price"],
+                            )
+                    except Exception as e:
+                        logger.error("Chunk sell failed @ $%.3f: %s", bid["price"], e)
+
+                if shares_remaining > 0:
+                    time.sleep(0.5)
+
         else:
             logger.info("OBSERVE  Would sell (observe-only mode)")
+            total_proceeds = initial_bid * pos["shares"]
+            total_cost = pos.get("actual_cost", pos["entry_price"] * pos["shares"])
 
-        proceeds = fill_bid * pos["shares"]
-        total_loss = cost - proceeds
+        total_loss = total_cost - total_proceeds
+        avg_price = total_proceeds / pos["shares"] if pos["shares"] > 0 else initial_bid
         logger.info(
-            "STOP-LOSS complete  |  exit $%.3f  |  loss $%.2f",
-            fill_bid, total_loss,
+            "STOP-LOSS complete  |  avg exit $%.3f  |  total proceeds $%.2f  |  loss $%.2f",
+            avg_price, total_proceeds, total_loss,
         )
         self.stats["resolved"] += 1
         self.stats["total_pnl"] -= total_loss
         self.per_trade_budget -= total_loss
-        self.local_cash = (self.local_cash or 0) + proceeds
+        self.local_cash = (self.local_cash or 0) + total_proceeds
         self.position = None
         logger.info("Stop-loss done. Continuing to next market...")
 
