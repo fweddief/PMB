@@ -233,7 +233,7 @@ class MomentumTrader:
                     except Exception as e:
                         logger.error("Sell attempt %d/5 failed: %s", attempt, e)
                     if attempt < 5:
-                        time.sleep(3)
+                        time.sleep(0.5)
                 if not sold:
                     logger.warning("All sell attempts failed — will hold through resolution")
                     pos["sell_failed"] = True
@@ -305,7 +305,7 @@ class MomentumTrader:
                     except Exception as e:
                         logger.error("Expiry sell attempt %d/5 failed: %s", attempt, e)
                     if attempt < 5:
-                        time.sleep(3)
+                        time.sleep(0.5)
                 if sold:
                     proceeds = pos["shares"] * best_bid
                     pnl = proceeds - cost
@@ -452,54 +452,76 @@ class MomentumTrader:
             logger.error("Failed to execute entry for %s: %s", market["slug"], e)
             # Do NOT discard slug — order may have gone on-chain before the exception
 
-    def execute_stop_loss(self, current_bid: float):
-        """Sell position to limit loss."""
+    def execute_stop_loss(self, initial_bid: float):
+        """Sell position to limit loss — retries every 0.5s until filled or market expires."""
         if not self.position:
             return
 
         pos = self.position
+        market = pos["market"]
         cost = pos.get("actual_cost", pos["entry_price"] * pos["shares"])
-        proceeds = current_bid * pos["shares"]
-        total_loss = cost - proceeds
+        fill_bid = initial_bid
 
         logger.info(
-            "STOP-LOSS  %s @ $%.3f -> $%.3f  |  %d shares  |  loss $%.2f",
-            pos["side"], pos["entry_price"], current_bid, pos["shares"], total_loss,
+            "STOP-LOSS  %s @ $%.3f -> $%.3f  |  %d shares",
+            pos["side"], pos["entry_price"], initial_bid, pos["shares"],
         )
 
-        if self.observe_only:
-            logger.info("OBSERVE  Would sell (observe-only mode)")
-        else:
+        if not self.observe_only:
             sold = False
-            for attempt in range(1, 6):
+            attempt = 0
+            while not sold:
+                # Let the settlement path handle it if market has already expired
+                if datetime.now(timezone.utc) >= market["end_date"]:
+                    logger.info("Market expired mid-stop-loss — settlement will handle position")
+                    return
+
+                attempt += 1
+                # Refresh bid on every attempt so FOK uses the live price
+                try:
+                    fresh_book = self.exchange.get_order_book(pos["token_id"])
+                    if fresh_book["bids"]:
+                        fill_bid = max(b["price"] for b in fresh_book["bids"])
+                except Exception:
+                    pass
+
+                if fill_bid <= 0:
+                    time.sleep(0.5)
+                    continue
+
                 try:
                     result = self.exchange.sell(
                         token_id=pos["token_id"],
                         shares=pos["shares"],
-                        price=current_bid,
+                        price=fill_bid,
                     )
                     if result:
-                        logger.info("Stop-loss sell submitted: %s", result)
+                        logger.info(
+                            "Stop-loss filled (attempt %d) @ $%.3f", attempt, fill_bid
+                        )
                         sold = True
-                        break
                     else:
-                        logger.warning("Sell returned None (attempt %d/5)", attempt)
+                        logger.warning("Attempt %d: no fill — retrying in 0.5s", attempt)
                 except Exception as e:
-                    logger.error("Sell attempt %d/5 failed: %s", attempt, e)
-                if attempt < 5:
-                    time.sleep(3)
-            if not sold:
-                logger.error("ALL SELL ATTEMPTS FAILED — %d shares of %s stranded!", pos["shares"], pos["side"])
-                logger.error("ACTION REQUIRED: Sell manually on %s!", self.exchange.exchange_name.title())
-                return  # Keep position so bot knows shares are stranded
+                    logger.error("Attempt %d failed: %s — retrying", attempt, e)
 
+                if not sold:
+                    time.sleep(0.5)
+        else:
+            logger.info("OBSERVE  Would sell (observe-only mode)")
+
+        proceeds = fill_bid * pos["shares"]
+        total_loss = cost - proceeds
+        logger.info(
+            "STOP-LOSS complete  |  exit $%.3f  |  loss $%.2f",
+            fill_bid, total_loss,
+        )
         self.stats["resolved"] += 1
         self.stats["total_pnl"] -= total_loss
         self.per_trade_budget -= total_loss
         self.local_cash = (self.local_cash or 0) + proceeds
         self.position = None
-
-        logger.info("STOP-LOSS triggered. Continuing to next market...")
+        logger.info("Stop-loss done. Continuing to next market...")
 
     # ------------------------------------------------------------------
     # Stats & main loop
@@ -509,9 +531,9 @@ class MomentumTrader:
         s = self.stats
         logger.info(
             "STATS  |  scans: %d  |  trades: %d  |  wins: %d  |  resolved: %d  |  "
-            "spent: $%.2f  |  P&L: %+.2f  |  per-trade: $%.2f",
+            "spent: $%.2f  |  P&L: %+.2f  |  budget/trade: $%.2f",
             s["scans"], s["trades"], s["wins"], s["resolved"],
-            s["total_spent"], s["total_pnl"], self.per_trade_budget,
+            s["total_spent"], s["total_pnl"], self._initial_budget,
         )
 
     def run(self):

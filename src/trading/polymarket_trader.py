@@ -404,16 +404,17 @@ class PolymarketTrader:
         token_id: str,
         shares: int,
         price: float = None,
-        slippage_tolerance: float = 0.05,
     ) -> Optional[Dict]:
         """
-        Create a market sell order for a specific outcome token.
+        Create an immediate FOK sell order for a specific outcome token.
+
+        Uses Fill-Or-Kill so the order either fills instantly against existing bids
+        or cancels (caller retries). No GTC orders are left dangling in the book.
 
         Args:
             token_id: Token ID (outcome ID from Polymarket)
             shares: Number of shares to sell
-            price: Expected price (for slippage check), if None uses current market price
-            slippage_tolerance: Maximum allowed slippage (default 5%)
+            price: Bid price to sell at; if None, fetches current market price
 
         Returns:
             Order result dictionary or None if failed
@@ -432,19 +433,12 @@ class PolymarketTrader:
                 logger.warning(f"No shares to sell")
                 return None
 
-            # Force re-approve token for sell
-            if token_id in self._approved_tokens:
-                self._approved_tokens.discard(token_id)
-            self.ensure_token_allowance(token_id)
-            time.sleep(5)  # let approval settle on-chain before submitting sell
-
-            # Use LIMIT ORDER (GTC) instead of market order
-            limit_price = price * (1 - slippage_tolerance)
+            # Sell at the current bid price, rounded to tick size
             tick_size = float(self.client.get_tick_size(token_id))
-            limit_price = max(tick_size, round(limit_price / tick_size) * tick_size)
+            limit_price = max(tick_size, round(price / tick_size) * tick_size)
 
-            logger.info(f"Creating LIMIT sell order: {shares} shares of {token_id}")
-            logger.info(f"  Limit price: ${limit_price:.4f} (total: ${shares * price:.2f})")
+            logger.info(f"Creating FOK sell order: {shares} shares of {token_id}")
+            logger.info(f"  Price: ${limit_price:.4f} (total: ${shares * limit_price:.2f})")
 
             order_args = OrderArgs(
                 price=float(limit_price),
@@ -454,9 +448,13 @@ class PolymarketTrader:
             )
 
             signed_order = self.client.create_order(order_args)
-            resp = self.client.post_order(signed_order, OrderType.GTC)
+            resp = self.client.post_order(signed_order, OrderType.FOK)
 
-            logger.info(f"✓ Limit sell order posted: {resp.get('orderID', 'unknown')}")
+            status = resp.get('status', 'unknown')
+            logger.info(f"✓ FOK sell order: {resp.get('orderID', 'unknown')}  status={status}")
+            if resp.get('errorMsg'):
+                logger.warning(f"FOK sell rejected: {resp['errorMsg']}")
+                return None
             return resp
 
         except Exception as e:
