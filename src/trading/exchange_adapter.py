@@ -60,3 +60,7 @@ class ExchangeAdapter(ABC):
     def check_settlement(self, token_id: str) -> Optional[str]:
         """Check if market settled. Returns 'yes', 'no', or None if not yet settled."""
         return None
+
+    def redeem_position(self, condition_id: str, is_yes_token: bool) -> Optional[str]:
+        """Redeem a winning position on-chain. Returns tx hash or None."""
+        return None

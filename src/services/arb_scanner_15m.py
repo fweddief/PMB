@@ -37,6 +37,7 @@ class MomentumTrader:
         self.exchange = exchange
         self.observe_only = observe_only
         self.per_trade_budget = per_trade_budget
+        self._initial_budget = per_trade_budget  # fixed cap per trade
         self.total_spent = 0.0
         self._stop_requested = False
         self.tracked_markets = []
@@ -266,6 +267,14 @@ class MomentumTrader:
                 self.stats["resolved"] += 1
                 if won:
                     self.stats["wins"] += 1
+                    # Trigger on-chain redemption for winning positions
+                    condition_id = market.get("condition_id", "")
+                    is_yes = (pos["token_id"] == market["yes_token"])
+                    if condition_id and hasattr(self.exchange, "redeem_position"):
+                        try:
+                            self.exchange.redeem_position(condition_id, is_yes)
+                        except Exception as exc:
+                            logger.warning("Auto-redeem failed — claim manually: %s", exc)
                 self.stats["total_pnl"] += pnl
                 self.per_trade_budget += pnl
                 self.local_cash = (self.local_cash or 0) + payout
@@ -371,13 +380,16 @@ class MomentumTrader:
             return
 
         on_chain_cash = self.get_available_cash()
-        if self.local_cash is None:
-            # Trust --budget if on-chain query returns 0 (common with proxy wallets)
-            self.local_cash = on_chain_cash if on_chain_cash > 0 else self.per_trade_budget
-        cash = min(self.local_cash, self.per_trade_budget)
+        if on_chain_cash > 0:
+            # Always sync to live wallet balance when available
+            self.local_cash = on_chain_cash
+        elif self.local_cash is None:
+            # Proxy wallets may return 0 — fall back to initial budget on first run
+            self.local_cash = self._initial_budget
+        cash = min(self.local_cash, self._initial_budget)
         if cash <= 0:
             logger.warning("No available cash (on-chain=$%.2f, local=$%.2f, budget=$%.2f)",
-                           on_chain_cash, self.local_cash, self.per_trade_budget)
+                           on_chain_cash, self.local_cash, self._initial_budget)
             return
 
         import math
