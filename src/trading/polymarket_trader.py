@@ -69,6 +69,8 @@ class PolymarketTrader:
 
         # Cache for approved tokens to avoid rate limiting
         self._approved_tokens: set[str] = set()
+        # Tracks tokens that have had their sell-path allowance set this session
+        self._sell_approved: set[str] = set()
 
         # Initialize CLOB client
         try:
@@ -432,6 +434,14 @@ class PolymarketTrader:
             if shares == 0:
                 logger.warning(f"No shares to sell")
                 return None
+
+            # Polymarket proxy wallet requires explicit conditional token approval for sells.
+            # This is different from the buy-time approval — must be done once per sell session.
+            if token_id not in self._sell_approved:
+                self._approved_tokens.discard(token_id)   # force fresh approval
+                self.ensure_token_allowance(token_id)
+                time.sleep(2)                              # reduced from original 5s
+                self._sell_approved.add(token_id)
 
             # Sell at the current bid price, rounded to tick size
             tick_size = float(self.client.get_tick_size(token_id))
