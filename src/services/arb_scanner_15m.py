@@ -562,11 +562,12 @@ class MomentumTrader:
 
     def print_stats(self):
         s = self.stats
+        cash_str = f"${self.local_cash:.2f}" if self.local_cash is not None else "unknown"
         logger.info(
             "STATS  |  scans: %d  |  trades: %d  |  wins: %d  |  resolved: %d  |  "
-            "spent: $%.2f  |  P&L: %+.2f  |  budget/trade: $%.2f",
+            "spent: $%.2f  |  P&L: %+.2f  |  cash: %s  |  budget/trade: $%.2f",
             s["scans"], s["trades"], s["wins"], s["resolved"],
-            s["total_spent"], s["total_pnl"], self._initial_budget,
+            s["total_spent"], s["total_pnl"], cash_str, self._initial_budget,
         )
 
     def run(self):
