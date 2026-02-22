@@ -30,6 +30,7 @@ class MomentumTrader:
     ENTRY_PRICE = 0.87       # Buy when best ask >= this
     MAX_ENTRY_PRICE = 0.95   # Don't buy past this price
     STOP_LOSS = 0.75         # Sell if best bid drops below this
+    FILL_SLIPPAGE_TOLERANCE = 0.02  # Allow fills up to 2¢ below signal price
     MARKET_REFRESH_INTERVAL = 60   # seconds
     SCAN_INTERVAL = 1.0      # seconds
 
@@ -425,8 +426,9 @@ class MomentumTrader:
                 side, actual_shares, actual_cost, actual_price_per_share,
             )
 
-            # Reject if actual fill price is below entry threshold
-            if actual_price_per_share < self.ENTRY_PRICE:
+            # Reject only if fill is way below entry price (wrong-side fill, not slippage).
+            # Allow up to FILL_SLIPPAGE_TOLERANCE below signal price for normal market movement.
+            if actual_price_per_share < self.ENTRY_PRICE - self.FILL_SLIPPAGE_TOLERANCE:
                 logger.warning(
                     "BAD FILL — actual price $%.3f/share is below $%.2f entry threshold. "
                     "Likely filled on wrong side. Shares may be stranded!",
