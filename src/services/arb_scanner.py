@@ -1,8 +1,9 @@
 """
 Bitcoin 5-Minute Momentum Trader for Polymarket.
 
-When either Up or Down reaches $0.87 on the ask, buy that side and ride it
-to market resolution ($1.00 payout).  Stop-loss at $0.75 bid.
+When either Up or Down reaches $0.90 on the ask, buy that side and ride it
+to $0.97 (take-profit limit order).  Stop-loss at $0.80 bid — exits by
+walking down available bid levels until all shares are sold.
 
 Starts in observe-only mode by default.  Run with --live to enable execution.
 
@@ -34,12 +35,13 @@ logger = logging.getLogger(__name__)
 
 
 class MomentumTrader:
-    """Buys the winning side of BTC 5-min markets when price hits $0.87."""
+    """Buys the winning side of BTC 5-min markets when price hits $0.90."""
 
     GAMMA_API = "https://gamma-api.polymarket.com"
-    ENTRY_PRICE = 0.87       # Buy when best ask >= this
+    ENTRY_PRICE = 0.90       # Buy when best ask >= this
     MAX_ENTRY_PRICE = 0.95   # Don't buy past this price
-    STOP_LOSS = 0.75         # Sell if best bid drops below this
+    TAKE_PROFIT = 0.97       # Sell for profit when best bid >= this
+    STOP_LOSS = 0.80         # Sell if best bid drops below this
     MARKET_REFRESH_INTERVAL = 60   # seconds
     SCAN_INTERVAL = 1.0      # seconds
 
@@ -275,8 +277,8 @@ class MomentumTrader:
             logger.error("Error getting book for sell check: %s", e)
             best_bid = None
 
-        # Sell at $0.99 if bid is there (only try once per position)
-        if best_bid is not None and best_bid >= 0.99 and not pos.get("sell_failed"):
+        # Sell at take-profit if bid is there (only try once per position)
+        if best_bid is not None and best_bid >= self.TAKE_PROFIT and not pos.get("sell_failed"):
             proceeds = pos["shares"] * best_bid
             cost = pos.get("actual_cost", pos["entry_price"] * pos["shares"])
             pnl = proceeds - cost
@@ -435,34 +437,101 @@ class MomentumTrader:
         except Exception as e:
             logger.error("Failed to execute entry: %s", e)
 
-    def execute_stop_loss(self, current_bid: float):
-        """Sell position to limit loss."""
+    def execute_stop_loss(self, initial_bid: float):
+        """Walk the bid book level-by-level — sell into each available bid until all
+        shares are gone or the market expires."""
         if not self.position:
             return
 
         pos = self.position
-        cost = pos.get("actual_cost", pos["entry_price"] * pos["shares"])
-        proceeds = current_bid * pos["shares"]
-        total_loss = cost - proceeds
+        market = pos["market"]
+        total_cost = pos.get("actual_cost", pos["entry_price"] * pos["shares"])
 
         logger.info(
-            "STOP-LOSS  %s @ $%.3f -> $%.3f  |  %d shares  |  loss $%.2f",
-            pos["side"], pos["entry_price"], current_bid, pos["shares"], total_loss,
+            "STOP-LOSS  %s @ $%.3f -> $%.3f  |  %d shares",
+            pos["side"], pos["entry_price"], initial_bid, pos["shares"],
         )
 
-        if self.observe_only:
-            logger.info("OBSERVE  Would sell (observe-only mode)")
-        else:
-            try:
-                result = self.trader.create_market_sell_order(
-                    token_id=pos["token_id"],
-                    shares=pos["shares"],
-                    price=current_bid,
-                )
-                logger.info("Stop-loss sell submitted: %s", result)
-            except Exception as e:
-                logger.error("Failed to execute stop-loss: %s", e)
+        total_proceeds = 0.0
 
+        if not self.observe_only:
+            shares_remaining = pos["shares"]
+
+            while shares_remaining > 0:
+                # Market expired mid-sell — let settlement handle the rest
+                if datetime.now(timezone.utc) >= market["end_date"]:
+                    sold_shares = pos["shares"] - shares_remaining
+                    logger.info(
+                        "Market expired — sold %d/%d shares ($%.2f), %d going to settlement",
+                        sold_shares, pos["shares"], total_proceeds, shares_remaining,
+                    )
+                    if sold_shares > 0:
+                        sold_cost = total_cost * (sold_shares / pos["shares"])
+                        self.stats["total_pnl"] += total_proceeds - sold_cost
+                        self.per_trade_budget += total_proceeds - sold_cost
+                        pos["shares"] = shares_remaining
+                        pos["actual_cost"] = total_cost - sold_cost
+                    return  # settlement path in _monitor_position handles the rest
+
+                try:
+                    books = self.client.get_order_books(
+                        [BookParams(token_id=pos["token_id"])]
+                    )
+                    bids = []
+                    if books and books[0].bids:
+                        bids = sorted(
+                            books[0].bids, key=lambda o: float(o.price), reverse=True
+                        )
+                except Exception:
+                    time.sleep(0.5)
+                    continue
+
+                if not bids:
+                    logger.warning("No bids available — waiting 0.5s")
+                    time.sleep(0.5)
+                    continue
+
+                for bid in bids:
+                    if shares_remaining <= 0:
+                        break
+                    bid_price = float(bid.price)
+                    bid_size = int(float(bid.size))
+                    chunk = min(bid_size, shares_remaining)
+                    if chunk <= 0:
+                        continue
+                    try:
+                        result = self.trader.create_market_sell_order(
+                            token_id=pos["token_id"],
+                            shares=chunk,
+                            price=bid_price,
+                        )
+                        if result:
+                            total_proceeds += chunk * bid_price
+                            shares_remaining -= chunk
+                            logger.info(
+                                "Sold %d shares @ $%.3f  |  %d remaining",
+                                chunk, bid_price, shares_remaining,
+                            )
+                        else:
+                            logger.warning(
+                                "Chunk sell returned None @ $%.3f — will retry", bid_price
+                            )
+                    except Exception as e:
+                        logger.error("Chunk sell failed @ $%.3f: %s", bid_price, e)
+
+                if shares_remaining > 0:
+                    time.sleep(0.5)
+
+        else:
+            logger.info("OBSERVE  Would sell (observe-only mode)")
+            total_proceeds = initial_bid * pos["shares"]
+
+        total_loss = total_cost - total_proceeds
+        avg_price = total_proceeds / pos["shares"] if pos["shares"] > 0 else initial_bid
+        logger.info(
+            "STOP-LOSS complete  |  avg exit $%.3f  |  total proceeds $%.2f  |  loss $%.2f",
+            avg_price, total_proceeds, total_loss,
+        )
         self.stats["resolved"] += 1
         self.stats["total_pnl"] -= total_loss
         self.per_trade_budget -= total_loss
@@ -472,7 +541,7 @@ class MomentumTrader:
             logger.info("Budget depleted ($%.2f). Stopping.", self.per_trade_budget)
             self._stop_requested = True
         else:
-            logger.info("LOSS — budget now $%.2f. Continuing...", self.per_trade_budget)
+            logger.info("Stop-loss done. Budget now $%.2f. Continuing...", self.per_trade_budget)
 
     # ------------------------------------------------------------------
     # Stats & main loop
@@ -492,8 +561,9 @@ class MomentumTrader:
         mode = "OBSERVE ONLY" if self.observe_only else "LIVE TRADING"
         logger.info("Momentum Trader starting  |  mode: %s", mode)
         logger.info(
-            "Entry: $%.2f  |  Stop-loss: $%.2f  |  Per-trade: $%.2f  |  scan: %.1fs",
+            "Entry: $%.2f  |  Take-profit: $%.2f  |  Stop-loss: $%.2f  |  Per-trade: $%.2f  |  scan: %.1fs",
             self.ENTRY_PRICE,
+            self.TAKE_PROFIT,
             self.STOP_LOSS,
             self.per_trade_budget,
             self.SCAN_INTERVAL,

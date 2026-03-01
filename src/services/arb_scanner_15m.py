@@ -1,8 +1,9 @@
 """
 Bitcoin 15-Minute Momentum Trader (exchange-agnostic).
 
-When either Up or Down reaches $0.87 on the ask, buy that side and ride it
-to market resolution ($1.00 payout).  Stop-loss at $0.75 bid.
+When either Up or Down reaches $0.90 on the ask, buy that side and ride it
+to $0.97 (take-profit).  Stop-loss at $0.80 bid — exits by walking down
+available bid levels until all shares are sold.
 
 Supports both Polymarket and Kalshi via the ExchangeAdapter interface.
 
@@ -25,11 +26,12 @@ logger = logging.getLogger(__name__)
 
 
 class MomentumTrader:
-    """Buys the winning side of BTC 15-min markets when price hits $0.87."""
+    """Buys the winning side of BTC 15-min markets when price hits $0.90."""
 
-    ENTRY_PRICE = 0.87       # Buy when best ask >= this
+    ENTRY_PRICE = 0.90       # Buy when best ask >= this
     MAX_ENTRY_PRICE = 0.95   # Don't buy past this price
-    STOP_LOSS = 0.75         # Sell if best bid drops below this
+    TAKE_PROFIT = 0.97       # Sell for profit when best bid >= this
+    STOP_LOSS = 0.80         # Sell if best bid drops below this
     FILL_SLIPPAGE_TOLERANCE = 0.02  # Allow fills up to 2¢ below signal price
     MARKET_REFRESH_INTERVAL = 60   # seconds
     SCAN_INTERVAL = 1.0      # seconds
@@ -207,8 +209,8 @@ class MomentumTrader:
             logger.error("Error getting book for sell check: %s", e)
             best_bid = None
 
-        # Sell at $0.97+ if bid is there
-        if best_bid is not None and best_bid >= 0.97 and not pos.get("sell_failed"):
+        # Sell at take-profit if bid is there
+        if best_bid is not None and best_bid >= self.TAKE_PROFIT and not pos.get("sell_failed"):
             proceeds = pos["shares"] * best_bid
             cost = pos.get("actual_cost", pos["entry_price"] * pos["shares"])
             pnl = proceeds - cost
@@ -578,8 +580,9 @@ class MomentumTrader:
             self.exchange.exchange_name, mode,
         )
         logger.info(
-            "Entry: $%.2f  |  Stop-loss: $%.2f  |  Per-trade: $%.2f  |  scan: %.1fs",
+            "Entry: $%.2f  |  Take-profit: $%.2f  |  Stop-loss: $%.2f  |  Per-trade: $%.2f  |  scan: %.1fs",
             self.ENTRY_PRICE,
+            self.TAKE_PROFIT,
             self.STOP_LOSS,
             self.per_trade_budget,
             self.SCAN_INTERVAL,
